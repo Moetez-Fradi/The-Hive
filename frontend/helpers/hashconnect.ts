@@ -1,3 +1,4 @@
+// use hashconnect instead of cryptowallet
 import { HashConnect } from "hashconnect";
 import { TransferTransaction, Hbar } from "@hashgraph/sdk";
 
