@@ -1,0 +1,91 @@
+{
+  "users": [
+    { "email": "builder@example.com", "password": "CHANGE_ME", "displayName": "CHANGE_ME", "walletAccountId": "0.0.CHANGE_ME"
+    },
+    { "email": "creator@example.com", "password": "CHANGE_ME", "displayName": "CHANGE_ME", "walletAccountId": "0.0.CHANGE_ME"
+    }
+  ],
+  "tools": [
+    {
+      "ownerEmail": "creator@example.com",
+      "name": "CHANGE_ME translator name",
+      "description": "Gemini Flash Lite translator. Detects the source language and translates into the configured target.",
+      "dockerImageUrl": "agenthive/text-translator:latest",
+      "usagePrice": 0.5,
+      "requiredEnv": [
+        "GEMINI_API_KEY",
+        "DEFAULT_TARGET_LANG"
+      ],
+      "inputShape": "{\"text\": \"string\"}",
+      "outputShape": "{\"text\": \"string\", \"sourceLang\": \"string\", \"targetLang\": \"string\"}"
+    },
+    {
+      "ownerEmail": "creator@example.com",
+      "name": "CHANGE_ME classifier name",
+      "description": "Gemini Flash Lite classifier with schema-constrained output: one of your categories, a confidence score and a reason.",
+      "dockerImageUrl": "agenthive/text-classifier:latest",
+      "usagePrice": 1,
+      "requiredEnv": [
+        "GEMINI_API_KEY",
+        "CATEGORIES"
+      ],
+      "inputShape": "{\"text\": \"string\"}",
+      "outputShape": "{\"closest_category\": \"string\", \"confidence\": \"number\", \"reason\": \"string\"}"
+    },
+    {
+      "ownerEmail": "builder@example.com",
+      "name": "CHANGE_ME emailer name",
+      "description": "Sends an email notification over SMTP.",
+      "dockerImageUrl": "agenthive/emailer:latest",
+      "usagePrice": 0.2,
+      "requiredEnv": [
+        "SMTP_USER",
+        "SMTP_PASS",
+        "SMTP_HOST",
+        "SMTP_PORT"
+      ],
+      "inputShape": "{\"message\": \"string\", \"email\": \"string\"}",
+      "outputShape": "{\"status\": \"string\"}"
+    }
+  ],
+  "workflows": [
+    {
+      "ownerEmail": "builder@example.com",
+      "name": "CHANGE_ME workflow name",
+      "description": "Translate incoming customer messages, then classify them.",
+      "steps": [
+        {
+          "tool": "CHANGE_ME translator name",
+          "env": {
+            "GEMINI_API_KEY": "${GEMINI_API_KEY}",
+            "DEFAULT_TARGET_LANG": "en"
+          }
+        },
+        {
+          "tool": "CHANGE_ME classifier name",
+          "env": {
+            "GEMINI_API_KEY": "${GEMINI_API_KEY}",
+            "CATEGORIES": "billing,bug report,feature request,other"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": 0,
+          "to": 1,
+          "mapping": {
+            "text": "{{text}}"
+          }
+        }
+      ]
+    }
+  ],
+  "reviews": [
+    {
+      "userEmail": "builder@example.com",
+      "tool": "CHANGE_ME translator name",
+      "stars": 5,
+      "comment": "CHANGE_ME"
+    }
+  ]
+}

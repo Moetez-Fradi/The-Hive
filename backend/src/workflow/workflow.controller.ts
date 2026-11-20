@@ -55,6 +55,11 @@ export class WorkflowController {
     await this.workflowService.deleteWorkflow(id, req.user.id);
   }
 
+  @Get('search')
+  async search(@Query('q') query: string) {
+    return this.workflowService.searchWorkflows(query, 10);
+  }
+
   @Get(':id')
   async get(@Param('id') id: string) {
     return this.workflowService.findById(id);
@@ -66,8 +71,4 @@ export class WorkflowController {
     return this.workflowService.listWorkflows(pageNum, 10);
   }
 
-  @Get('search')
-  async search(@Query('q') query: string) {
-    return this.workflowService.searchWorkflows(query, 10);
-  }
 }

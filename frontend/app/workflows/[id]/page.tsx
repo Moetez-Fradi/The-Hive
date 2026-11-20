@@ -15,6 +15,25 @@ import ReactFlow, {
   NodeProps,
 } from 'reactflow';
 import 'reactflow/dist/style.css';
+import { useUserStore } from '../../../store/useUserStore';
+import RunProof from '../../../components/RunProof';
+
+const API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, '') || 'http://localhost:3001') as string;
+
+type RunSummary = {
+  id: string;
+  status: string;
+  mode: string;
+  runtimeMs: number;
+  createdAt: string;
+  inputHash: string;
+  outputHash: string;
+  runHash: string;
+  hcsTopicId?: string | null;
+  hcsSequence?: number | null;
+  hcsTxId?: string | null;
+  links?: { topicUrl: string; messageUrl: string; transactionUrl: string | null } | null;
+};
 
 interface Workflow {
   id: string;
@@ -30,6 +49,7 @@ interface Workflow {
   createdAt: string;
   owner?: { id: string; displayName?: string; email?: string };
   estimatedCost?: number;
+  workflowStatus?: string;
 }
 
 // --- Custom node for ReactFlow ---
@@ -70,6 +90,31 @@ export default function WorkflowDetailPage() {
   const workflowId = (params as any).id as string;
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [loading, setLoading] = useState(true);
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [openRun, setOpenRun] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const { token, userId } = useUserStore();
+
+  useEffect(() => {
+    if (!workflowId) return;
+    axios.get<RunSummary[]>(`${API_BASE}/workflows/${workflowId}/runs`).then(r => setRuns(r.data)).catch(() => setRuns([]));
+  }, [workflowId]);
+
+  const startDeployment = async () => {
+    if (!workflow) return;
+    setStarting(true);
+    try {
+      const res = await axios.post(
+        `${API_BASE}/workflow-instances`,
+        { workflowId: workflow.id },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      router.push(`/workflows/testing/${res.data.id}`);
+    } catch (err: any) {
+      alert(err?.response?.data?.message ?? err.message);
+      setStarting(false);
+    }
+  };
 
   useEffect(() => {
     const loadWorkflow = async () => {
@@ -210,14 +255,23 @@ export default function WorkflowDetailPage() {
             <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-2 gap-5 text-sm text-gray-300">
               <div><span className="font-semibold text-cyan-300">Owner:</span> {workflow.owner?.displayName ?? workflow.owner?.email ?? '—'}</div>
               <div><span className="font-semibold text-cyan-300">Created:</span> {new Date(workflow.createdAt).toLocaleString()}</div>
-              <div><span className="font-semibold text-cyan-300">Fixed Fee:</span> {workflow.fixedUsageFee === 0 ? 'Free' : `$${workflow.fixedUsageFee}`}</div>
-              <div><span className="font-semibold text-cyan-300">Estimated usage Fee:</span> {workflow.estimatedCost || "unknown"}</div>
+              <div><span className="font-semibold text-cyan-300">Status:</span> {workflow.workflowStatus === 'DEPLOYED' ? 'Deployed' : 'Not deployed'}</div>
+              <div><span className="font-semibold text-cyan-300">Deployment cost:</span> {workflow.estimatedCost ? `${workflow.estimatedCost} HBAR` : 'Free'}</div>
               <div><span className="font-semibold text-cyan-300">Total Nodes:</span> {workflow.graphJson.nodes.length}</div>
               <div><span className="font-semibold text-cyan-300">Total Edges:</span> {workflow.graphJson.edges.length}</div>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
+            {userId && userId === workflow.ownerUserId && (
+              <button
+                onClick={startDeployment}
+                disabled={starting}
+                className="px-6 py-3 rounded-xl border border-cyan-400/50 text-cyan-200 hover:bg-cyan-400/10 font-semibold transition disabled:opacity-50"
+              >
+                {starting ? 'Starting containers…' : workflow.workflowStatus === 'DEPLOYED' ? 'Redeploy' : 'Test and deploy'}
+              </button>
+            )}
             <button
               onClick={() => router.push(`/workflows/${workflow.id}/try`)}
               className="px-6 py-3 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-black font-semibold shadow-md transition"
@@ -290,6 +344,54 @@ export default function WorkflowDetailPage() {
               </div>
             ))}
           </div>
+        </section>
+
+        <section className="space-y-4">
+          <div className="flex items-baseline justify-between">
+            <h3 className="text-xl font-bold text-cyan-300">Verifiable run history</h3>
+            {runs[0]?.links?.topicUrl && (
+              <a href={runs[0].links.topicUrl} target="_blank" rel="noreferrer" className="text-sm text-cyan-300 underline">
+                Audit topic on HashScan
+              </a>
+            )}
+          </div>
+          {runs.length === 0 ? (
+            <div className="text-gray-400 text-sm">No runs yet. Every run is hashed and anchored on the Hedera Consensus Service.</div>
+          ) : (
+            <div className="space-y-2">
+              {runs.map(r => (
+                <div key={r.id} className="rounded-xl bg-white/5 border border-white/10">
+                  <button
+                    onClick={() => setOpenRun(openRun === r.id ? null : r.id)}
+                    className="w-full flex items-center justify-between gap-4 p-4 text-sm text-left"
+                  >
+                    <span className="text-gray-300">{new Date(r.createdAt).toLocaleString()}</span>
+                    <span className={r.status === 'ok' ? 'text-green-300' : 'text-yellow-300'}>{r.status}</span>
+                    <span className="text-gray-400">{r.mode}</span>
+                    <span className="text-gray-400">{r.runtimeMs} ms</span>
+                    <span className="font-mono text-xs text-gray-400">{r.hcsTopicId ? `HCS #${r.hcsSequence}` : 'not anchored'}</span>
+                  </button>
+                  {openRun === r.id && (
+                    <div className="px-4 pb-4">
+                      <RunProof
+                        runId={r.id}
+                        proof={{
+                          inputHash: r.inputHash,
+                          outputHash: r.outputHash,
+                          runHash: r.runHash,
+                          topicId: r.hcsTopicId ?? undefined,
+                          sequenceNumber: r.hcsSequence ?? undefined,
+                          transactionId: r.hcsTxId ?? undefined,
+                          messageUrl: r.links?.messageUrl,
+                          transactionUrl: r.links?.transactionUrl,
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         {/* --- Edges --- */}

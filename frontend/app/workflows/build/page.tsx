@@ -22,6 +22,20 @@ import ReactFlow, {
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 import RouteGuard from '../../../components/RouteGuard';
+import { useUserStore } from '../../../store/useUserStore';
+
+type Composition = {
+  name: string;
+  description: string;
+  explanation: string;
+  graphJson: {
+    nodes: Array<{ id: string; name: string; toolId: string; purpose?: string; env: Record<string, string> }>;
+    edges: Array<{ from: string; to: string; mapping: Record<string, string>; condition?: string }>;
+  };
+  secretsNeeded: Array<{ node: string; key: string }>;
+  estimatedCostHbar: number;
+  model: string;
+};
 
 /* ────────────────────── Types ────────────────────── */
 interface Tool {
@@ -115,6 +129,65 @@ function FlowCanvas() {
 
   // Visibility toggles for env inputs (single state object, keys = env names)
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
+
+  const token = useUserStore(st => st.token);
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [composing, setComposing] = useState(false);
+  const [composition, setComposition] = useState<Composition | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+
+  const composeWithAi = async () => {
+    if (!aiPrompt.trim()) return;
+    setComposing(true);
+    setAiError(null);
+    try {
+      const res = await axios.post<Composition>(
+        `${process.env.NEXT_PUBLIC_BACKEND_URL}/ai/compose`,
+        { prompt: aiPrompt },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      const plan = res.data;
+      const toolById = new Map(tools.map(t => [t.id, t]));
+      setNodes(
+        plan.graphJson.nodes.map((n, i) => {
+          const tool = toolById.get(n.toolId);
+          return {
+            id: n.id,
+            type: 'custom',
+            position: { x: 80 + i * 380, y: 120 + (i % 2) * 60 },
+            data: {
+              label: n.name,
+              toolId: n.toolId,
+              toolName: tool?.name ?? n.name,
+              inputShape: tool?.inputShape,
+              outputShape: tool?.outputShape,
+              env: n.env,
+            },
+          };
+        }),
+      );
+      setEdges(
+        plan.graphJson.edges.map((e, i) => ({
+          id: `ai-${e.from}-${e.to}-${i}`,
+          source: e.from,
+          target: e.to,
+          sourceHandle: `out-${e.from}`,
+          targetHandle: `in-${e.to}`,
+          type: 'smoothstep',
+          animated: Boolean(e.condition),
+          label: e.condition || undefined,
+          data: { condition: e.condition ?? '', mapping: e.mapping },
+        })),
+      );
+      setWorkflowName(plan.name);
+      setWorkflowDesc(plan.description);
+      setComposition(plan);
+    } catch (err: any) {
+      setAiError(err?.response?.data?.message ?? err.message);
+    } finally {
+      setComposing(false);
+    }
+  };
 
   /* ───── Load Tools ───── */
   useEffect(() => {
@@ -458,6 +531,42 @@ const saveWorkflow = async () => {
             Test
           </button>
         </header>
+
+        <section className="mt-6 rounded-2xl border border-cyan-400/20 bg-cyan-400/5 p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold text-cyan-300">Compose with AI</div>
+            <div className="text-xs text-gray-400">Gemini Flash Lite picks tools from the marketplace and wires them for you</div>
+          </div>
+          <div className="flex gap-3">
+            <textarea
+              value={aiPrompt}
+              onChange={e => setAiPrompt(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) composeWithAi();
+              }}
+              placeholder="e.g. Translate customer emails from Arabic or French to English, then tag them as billing, outage or feedback"
+              className="flex-1 h-16 bg-[#071424] border border-white/10 rounded-lg p-3 text-sm resize-none focus:outline-none focus:border-cyan-400/50"
+            />
+            <button
+              onClick={composeWithAi}
+              disabled={composing || !aiPrompt.trim() || loadingTools}
+              className="px-5 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-black font-semibold disabled:opacity-50"
+            >
+              {composing ? 'Composing…' : 'Compose'}
+            </button>
+          </div>
+          {aiError && <div className="text-sm text-red-300">{aiError}</div>}
+          {composition && (
+            <div className="text-sm text-gray-300 space-y-1">
+              <div>{composition.explanation}</div>
+              <div className="text-xs text-gray-400">
+                Estimated deployment cost {composition.estimatedCostHbar} HBAR · {composition.model}
+                {composition.secretsNeeded.length > 0 &&
+                  ` · Fill in ${Array.from(new Set(composition.secretsNeeded.map(x => x.key))).join(', ')} on each node before testing`}
+              </div>
+            </div>
+          )}
+        </section>
 
         {/* React-Flow Canvas: make it flex-1 so it expands/shrinks with layout */}
         <div className="flex-1 mt-6 border border-white/10 rounded-2xl overflow-hidden" ref={reactFlowWrapper}>

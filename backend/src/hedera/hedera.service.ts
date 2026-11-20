@@ -1,4 +1,3 @@
-// src/hedera/hedera.service.ts
 import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
 import {
   Client,
@@ -6,192 +5,206 @@ import {
   TransferTransaction,
   AccountId,
   PrivateKey,
-  TransactionRecordQuery,
+  TopicCreateTransaction,
+  TopicMessageSubmitTransaction,
   TransactionId,
+  Timestamp,
 } from '@hashgraph/sdk';
 import { PrismaService } from '../prisma/prisma.service';
 
+const MIRROR_NODE_URL = process.env.HEDERA_MIRROR_URL || 'https://testnet.mirrornode.hedera.com';
+
+export type AuditReceipt = {
+  topicId: string;
+  sequenceNumber: number;
+  transactionId: string;
+};
+
+export type MirrorTopicMessage = {
+  topicId: string;
+  sequenceNumber: number;
+  consensusTimestamp: string;
+  message: string;
+};
+
+export type MirrorTransaction = {
+  transactionId: string;
+  result: string;
+  payer: string;
+  memo: string;
+  consensusTimestamp: string;
+  transfers: Record<string, number>;
+};
+
 @Injectable()
 export class HederaService {
-  private client: Client;
+  private client: Client | null = null;
+  private topicId: Promise<string> | null = null;
+  private clockOffsetMs = 0;
+  private clockCheckedAt = 0;
   private readonly logger = new Logger(HederaService.name);
 
-  constructor(private readonly prisma: PrismaService) {
-    this.client = Client.forTestnet();
-    this.client.setOperator(
-      AccountId.fromString(process.env.OPERATOR_ID || ''),
-      PrivateKey.fromString(process.env.OPERATOR_KEY || '')
-    );
+  constructor(private readonly prisma: PrismaService) {}
+
+  private getClient(): Client {
+    if (this.client) return this.client;
+    const operatorId = process.env.OPERATOR_ID;
+    const operatorKey = process.env.OPERATOR_KEY;
+    if (!operatorId || !operatorKey) {
+      throw new InternalServerErrorException('OPERATOR_ID and OPERATOR_KEY must be set to use the Hedera operator');
+    }
+    const client = Client.forTestnet();
+    client.setOperator(AccountId.fromString(operatorId), HederaService.parseKey(operatorKey));
+    this.client = client;
+    return client;
   }
 
-  /** Directly transfer HBAR between two accounts. */
-  async transferHbar(
-    fromAccountId: string,
-    toAccountId: string,
-    amountHbar: number,
-    memo?: string
-  ) {
+  private async networkTxId(): Promise<TransactionId> {
+    if (Date.now() - this.clockCheckedAt > 10 * 60 * 1000) {
+      try {
+        const res = await fetch(`${MIRROR_NODE_URL}/api/v1/network/nodes?limit=1`, { method: 'HEAD' });
+        const networkNow = Date.parse(res.headers.get('date') ?? '');
+        if (!Number.isNaN(networkNow)) {
+          this.clockOffsetMs = Math.abs(networkNow - Date.now()) > 5000 ? networkNow - Date.now() : 0;
+          if (this.clockOffsetMs) this.logger.warn(`Local clock is off by ${Math.round(this.clockOffsetMs / 1000)}s, compensating`);
+        }
+        this.clockCheckedAt = Date.now();
+      } catch {}
+    }
+    const validStart = new Date(Date.now() + this.clockOffsetMs - 5000);
+    return TransactionId.withValidStart(AccountId.fromString(process.env.OPERATOR_ID!), Timestamp.fromDate(validStart));
+  }
+
+  static parseKey(raw: string): PrivateKey {
+    const key = raw.trim().replace(/^0x/, '');
+    if (key.startsWith('302e') || key.startsWith('3030')) return PrivateKey.fromStringDer(key);
+    if (process.env.OPERATOR_KEY_TYPE?.toUpperCase() === 'ED25519') return PrivateKey.fromStringED25519(key);
+    return PrivateKey.fromStringECDSA(key);
+  }
+
+  static toMirrorTxId(txId: string): string {
+    const [account, ts] = txId.split('@');
+    if (!ts) return txId;
+    const [secs, nanos = '0'] = ts.split('.');
+    return `${account}-${secs}-${nanos}`;
+  }
+
+  async getMirrorTransaction(txId: string, attempts = 10, delayMs = 1500): Promise<MirrorTransaction | null> {
+    const url = `${MIRROR_NODE_URL}/api/v1/transactions/${HederaService.toMirrorTxId(txId)}`;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const body: any = await res.json();
+          const tx = body?.transactions?.[0];
+          if (tx) {
+            const transfers: Record<string, number> = {};
+            for (const t of tx.transfers ?? []) {
+              transfers[t.account] = (transfers[t.account] || 0) + Number(t.amount) / 100_000_000;
+            }
+            return {
+              transactionId: tx.transaction_id,
+              result: tx.result,
+              payer: String(tx.transaction_id).split('-')[0],
+              memo: tx.memo_base64 ? Buffer.from(tx.memo_base64, 'base64').toString('utf8') : '',
+              consensusTimestamp: tx.consensus_timestamp,
+              transfers,
+            };
+          }
+        }
+      } catch (err: any) {
+        this.logger.warn(`Mirror node lookup failed: ${err?.message || err}`);
+      }
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+    return null;
+  }
+
+  async transferHbar(fromAccountId: string, toAccountId: string, amountHbar: number, memo?: string) {
+    const client = this.getClient();
     const tx = new TransferTransaction()
+      .setTransactionId(await this.networkTxId())
       .addHbarTransfer(fromAccountId, new Hbar(-amountHbar))
       .addHbarTransfer(toAccountId, new Hbar(amountHbar));
-
     if (memo) tx.setTransactionMemo(memo);
 
-    const response = await tx.execute(this.client);
-    const receipt = await response.getReceipt(this.client);
+    const response = await tx.execute(client);
+    const receipt = await response.getReceipt(client);
+    return { txId: response.transactionId.toString(), status: receipt.status.toString() };
+  }
 
+  isConfigured() {
+    return Boolean(process.env.OPERATOR_ID && process.env.OPERATOR_KEY);
+  }
+
+  async getAuditTopicId(): Promise<string> {
+    if (process.env.HCS_TOPIC_ID) return process.env.HCS_TOPIC_ID;
+    if (!this.topicId) {
+      this.topicId = this.loadOrCreateTopic().catch(err => {
+        this.topicId = null;
+        throw err;
+      });
+    }
+    return this.topicId;
+  }
+
+  private async loadOrCreateTopic(): Promise<string> {
+    const saved = await this.prisma.setting.findUnique({ where: { key: 'hcs_topic_id' } });
+    if (saved) return saved.value;
+
+    const client = this.getClient();
+    const operatorKey = HederaService.parseKey(process.env.OPERATOR_KEY!);
+    const tx = await new TopicCreateTransaction()
+      .setTransactionId(await this.networkTxId())
+      .setTopicMemo('AgentHive execution and payment audit log')
+      .setSubmitKey(operatorKey.publicKey)
+      .execute(client);
+    const receipt = await tx.getReceipt(client);
+    const topicId = receipt.topicId!.toString();
+    await this.prisma.setting.upsert({
+      where: { key: 'hcs_topic_id' },
+      update: { value: topicId },
+      create: { key: 'hcs_topic_id', value: topicId },
+    });
+    this.logger.log(`Created HCS audit topic ${topicId}`);
+    return topicId;
+  }
+
+  async submitAudit(message: Record<string, any>): Promise<AuditReceipt> {
+    const client = this.getClient();
+    const topicId = await this.getAuditTopicId();
+    const response = await new TopicMessageSubmitTransaction()
+      .setTransactionId(await this.networkTxId())
+      .setTopicId(topicId)
+      .setMessage(JSON.stringify(message))
+      .execute(client);
+    const receipt = await response.getReceipt(client);
     return {
-      txId: response.transactionId.toString(),
-      status: receipt.status.toString(),
+      topicId,
+      sequenceNumber: Number(receipt.topicSequenceNumber),
+      transactionId: response.transactionId.toString(),
     };
   }
 
-  /**
-   * Fetch the transaction record for a given txId (e.g. "0.0.1234@163....").
-   * Returns the raw record object returned by the SDK.
-   */
-  async getTransactionRecord(txId: string) {
-    try {
-      const txIdObj = TransactionId.fromString(txId);
-      const q = new TransactionRecordQuery().setTransactionId(txIdObj);
-      const record = await q.execute(this.client);
-      return record;
-    } catch (err: any) {
-      this.logger.error('Failed to fetch transaction record: ' + (err?.message || err));
-      throw new InternalServerErrorException('Failed to fetch transaction record');
-    }
-  }
-
-  /**
-   * Create a single Payment record (receipt) from an enriched graph.
-   * - instanceId: unique id (use the same one the frontend will query)
-   * - payerWallet: payer's walletAccountId (string)
-   * - enrichedGraph: result of enrichGraphWithTools (contains nodes)
-   * - memo: optional memo
-   *
-   * Returns the created Payment DB row.
-   */
-  async createPaymentReceiptFromGraph(instanceId: string, payerWallet: string, enrichedGraph: any, memo?: string) {
-    const nodes = enrichedGraph?.nodes ?? [];
-    if (!Array.isArray(nodes) || nodes.length === 0) {
-      // Create an empty payment record with zero total (still usable)
-      const createdEmpty = await this.prisma.payment.create({
-        data: {
-          instanceId,
-          payer: payerWallet,
-          receipt: [],
-          total: 0,
-          memo: memo ?? null,
-        },
-      });
-      return createdEmpty;
-    }
-
-    // Build receipt items from nodes -> tool ownerWallet & usagePrice
-    const receiptItems: Array<{ receiver: string; toolName?: string; amount: number }> = [];
-
-    // gather toolIds from nodes and fetch authoritative tool data
-    const toolIds = Array.from(new Set(nodes.map((n: any) => n.toolId).filter(Boolean)));
-    const tools = await this.prisma.tool.findMany({ where: { id: { in: toolIds } } });
-    const toolById = new Map(tools.map(t => [t.id, t]));
-
-    for (const node of nodes) {
-      const tool = toolById.get(node.toolId);
-      if (!tool) continue;
-      const receiver = tool.ownerWallet;
-      const amount = Number(tool.usagePrice ?? tool.fixedPrice ?? 0);
-      if (!receiver) continue; // skip tools with no owner wallet
-      receiptItems.push({ receiver, toolName: tool.name ?? node.name ?? tool.id, amount });
-    }
-
-    const total = receiptItems.reduce((s, it) => s + Number(it.amount || 0), 0);
-
-    const created = await this.prisma.payment.create({
-      data: {
-        instanceId,
-        payer: payerWallet,
-        receipt: receiptItems as any,
-        total,
-        memo: memo ?? null,
-      },
-    });
-
-    return created;
-  }
-
-  /**
-   * Convenience: create a Payment receipt and (optionally) make the actual transfers using the operator account.
-   * This will:
-   *  - create the Payment DB row (same as createPaymentReceiptFromGraph)
-   *  - if operatorExec === true -> build a single TransferTransaction debiting the operator and crediting each receiver (atomic)
-   *  - update the Payment row with txHash and set paid=true if transaction succeeded
-   *
-   * Use operatorExec=false for non-custodial mode (client pays).
-   */
-  async payToolOwnersAsOperator(instanceId: string, payerWallet: string, enrichedGraph: any, memo?: string, operatorExec = true) {
-    // 1) create receipt row
-    const createdPayment = await this.createPaymentReceiptFromGraph(instanceId, payerWallet, enrichedGraph, memo);
-
-    if (!operatorExec) {
-      // Not executing transfers from operator; return the created payment
-      return { payment: createdPayment };
-    }
-
-    // Build a single TransferTransaction from operator -> all receivers
-    const receiptItems: Array<{ receiver: string; toolName?: string; amount: number }> = createdPayment.receipt as any[] ?? [];
-    const transfersByReceiver: Record<string, number> = {};
-    for (const it of receiptItems) {
-      if (!it.receiver) continue;
-      transfersByReceiver[it.receiver] = (transfersByReceiver[it.receiver] || 0) + Number(it.amount || 0);
-    }
-
-    const receivers = Object.keys(transfersByReceiver);
-    if (receivers.length === 0) {
-      // nothing to pay; return created record unchanged
-      return { payment: createdPayment };
-    }
-
-    // Construct one TransferTransaction that debits operator and credits each receiver
-    let tx = new TransferTransaction();
-    const total = Object.values(transfersByReceiver).reduce((s, v) => s + Number(v), 0);
-
-    // operator as payer (negative)
-    tx = tx.addHbarTransfer(this.client.operatorAccountId!.toString(), new Hbar(-total));
-
-    for (const r of receivers) {
-      const amt = transfersByReceiver[r];
-      tx = tx.addHbarTransfer(r, new Hbar(amt));
-    }
-
-    if (memo) tx = tx.setTransactionMemo(memo);
-
-    try {
-      const response = await tx.execute(this.client);
-      const receipt = await response.getReceipt(this.client);
-      const txId = response.transactionId.toString();
-      const status = receipt.status.toString();
-
-      // If success, mark payment paid and store txHash
-      if (status === 'SUCCESS') {
-        const updated = await this.prisma.payment.update({
-          where: { instanceId: createdPayment.instanceId },
-          data: { txHash: txId, paid: true },
-        });
-        this.logger.log(`Operator paid receipts (tx=${txId}).`);
-        return { payment: updated, txId, status };
-      } else {
-        // mark txHash but leave paid=false
-        const updated = await this.prisma.payment.update({
-          where: { instanceId: createdPayment.instanceId },
-          data: { txHash: txId },
-        });
-        this.logger.error(`Operator transfer returned status ${status} (tx=${txId})`);
-        return { payment: updated, txId, status };
+  async getTopicMessage(topicId: string, sequenceNumber: number, attempts = 10, delayMs = 1500): Promise<MirrorTopicMessage | null> {
+    const url = `${MIRROR_NODE_URL}/api/v1/topics/${topicId}/messages/${sequenceNumber}`;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const body: any = await res.json();
+          return {
+            topicId: body.topic_id,
+            sequenceNumber: body.sequence_number,
+            consensusTimestamp: body.consensus_timestamp,
+            message: Buffer.from(body.message, 'base64').toString('utf8'),
+          };
+        }
+      } catch (err: any) {
+        this.logger.warn(`Mirror topic lookup failed: ${err?.message || err}`);
       }
-    } catch (err: any) {
-      this.logger.error('Operator payout failed: ' + (err?.message || err));
-      // leave payment unpaid, record error (optionally store error somewhere)
-      return { payment: createdPayment, error: err?.message ?? String(err) };
+      await new Promise(r => setTimeout(r, delayMs));
     }
+    return null;
   }
 }

@@ -2,6 +2,8 @@
 ## AI for people, powered by people.
 DePIN + AI agents platform for creating automation workflows, renting hardware, developping tools and more!
 
+**2026 edition:** verifiable runs ([live on testnet](https://hashscan.io/testnet/topic/0.0.11532808)) anchored on the Hedera Consensus Service, mirror-node verified payments that gate execution, paid renter nodes with reputation, a Gemini workflow composer, and a security pass over last year's code. See [WHATS-NEW.md](./WHATS-NEW.md).
+
 ## Project goal
 
 We build a decentralized AI-agent marketplace where developers publish Dockerized AI tools, users assemble workflows in a drag & drop fashion, and node hosts execute containers and get paid in HBAR via Hedera Testnet.
@@ -62,7 +64,7 @@ We build a decentralized AI-agent marketplace where developers publish Dockerize
 
 ## Hedera specifics
 	•	Hedera Testnet and @hashgraph/sdk (JS) in backend. Keep operator keys in backend .env
-	•	Flow: user transfers HBAR -> platform escrow account (platform operator gets TX ID) -> backend verifies receipt -> dispatches task -> on successful signed result from node, backend pays node & tool owner with TransferTransaction.
+	•	Flow: deploying a workflow produces a receipt -> the user pays tool owners and node operators directly from HashPack in one TransferTransaction -> the backend verifies it on the mirror node and unlocks runs -> every run's input and output hashes are anchored on an HCS topic and can be re-verified at any time.
 	•	Choose ED25519 keys for node signing to avoid ECDSA alias issues.
 
 ⸻
@@ -93,5 +95,5 @@ For detailed setup and deployment instructions, please refer to the **HOW-TO-RUN
   [View Certificate](https://certs.hashgraphdev.com/b5e911d8-32a0-471e-90fd-3fdd265f85d5.pdf)
 
 - **Project Presentation (Canva)**  
-  [View Presentation](https://www.canva.com/design/DAG6QspGDKU/H58jUZTdwr9Cfqbt_s9b_A/edit)
+  [View Presentation](https://www.canva.com/design/DAHbYxCDmLk/KnPt2cZifYhZzr6qsVPVPg/view)
 

@@ -62,3 +62,4 @@ prisma/dev.db
 prisma/migrations/
 *.db-journal
 backend/pnpm-lock.yaml
+prisma/seed-data.json

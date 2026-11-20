@@ -11,14 +11,17 @@ import localtunnel from "localtunnel";
 
 dotenv.config();
 
-const BACKEND_URL = process.env.BACKEND_URL;
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:3001";
 const NODE_FILE = process.env.NODE_FILE || "./node_keys.json";
 const NODE_PORT = parseInt(process.env.NODE_PORT || "9000");
+const USE_TUNNEL = process.env.USE_TUNNEL === "true";
+const PUBLIC_HOST = process.env.NODE_PUBLIC_HOST || "localhost";
 
 const docker = new Docker();
 const containers = new Map();
 
-function prompt(question) {
+function prompt(question, envValue) {
+  if (envValue) return Promise.resolve(envValue);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
 }
@@ -51,14 +54,18 @@ async function getNodeResources() {
   const totalCpus = os.cpus().length;
   const totalMemGB = os.totalmem() / 1024 / 1024 / 1024;
   console.log(`Your system has ${totalCpus} CPU cores and ${totalMemGB.toFixed(2)} GB RAM.`);
-  let cpus = await prompt(`CPU cores to allocate (1-${totalCpus}): `);
+  let cpus = await prompt(`CPU cores to allocate (1-${totalCpus}): `, process.env.NODE_CPUS);
   cpus = Math.min(Math.max(parseInt(cpus) || 1, 1), totalCpus);
-  let memGB = await prompt(`RAM to allocate in GB (0.5-${totalMemGB.toFixed(2)}): `);
+  let memGB = await prompt(`RAM to allocate in GB (0.5-${totalMemGB.toFixed(2)}): `, process.env.NODE_MEM_GB);
   memGB = Math.min(Math.max(parseFloat(memGB) || 0.5, 0.5), totalMemGB);
   return { cpus, memGB };
 }
 
 async function pullImage(image) {
+  try {
+    await docker.getImage(image).inspect();
+    return;
+  } catch {}
   return new Promise((resolve, reject) => {
     docker.pull(image, (err, stream) => {
       if (err) return reject(err);
@@ -76,19 +83,31 @@ async function startContainer(instanceId, image, envVars = {}) {
     ExposedPorts: { "80/tcp": {} },
     HostConfig: { PortBindings: { "80/tcp": [{ HostPort: hostPort.toString() }] }, AutoRemove: true },
   });
-  console.log("created");
   await container.start();
-  console.log("started");
-  const tunnel = await localtunnel({ port: hostPort });
-
-  const url = tunnel.url;
+  await waitForReady(`http://localhost:${hostPort}`);
+  const tunnel = USE_TUNNEL ? await localtunnel({ port: hostPort }) : null;
+  const url = tunnel ? tunnel.url : `http://${PUBLIC_HOST}:${hostPort}`;
   containers.set(instanceId, { container, url, tunnel });
   console.log(`Container ${instanceId} started at ${url}`);
 
   return { container, url };
 }
 
+async function waitForReady(baseUrl, timeoutMs = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await axios.get(baseUrl, { timeout: 2000, validateStatus: () => true });
+      return true;
+    } catch {
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  return false;
+}
+
 async function startLocalTunnel(port) {
+  if (!USE_TUNNEL) return `http://${PUBLIC_HOST}:${port}`;
   const tunnel = await localtunnel({ port });
   console.log(`Tunnel established: ${tunnel.url}`);
   tunnel.on("close", () => console.log("Tunnel closed."));
@@ -101,8 +120,8 @@ async function main() {
       ? JSON.parse(fs.readFileSync(NODE_FILE, "utf8"))
       : await generateKeyPair();
 
-    const email = await prompt("Email: ");
-    const password = await prompt("Password: ");
+    const email = await prompt("Email: ", process.env.NODE_EMAIL);
+    const password = await prompt("Password: ", process.env.NODE_PASSWORD);
     const token = await login(email, password);
     console.log("Logged in.");
 
@@ -111,17 +130,25 @@ async function main() {
     const publicUrl = await startLocalTunnel(NODE_PORT);
     console.log(`Node public URL: ${publicUrl}`);
 
-    const node = await registerNode(token, keys.publicKey, publicUrl, cpus, memGB);
-    console.log("Node registered:", node);
+    const { node } = await registerNode(token, keys.publicKey, publicUrl, cpus, memGB);
+    console.log(`Node registered: ${node.id} at ${publicUrl}`);
 
     const app = express();
     app.use(express.json());
 
     app.post("/start-container", async (req, res) => {
       try {
-        const { instanceId, dockerImageUrl, env } = req.body;
+        const { instanceId, dockerImageUrl, env, token: oneTimeToken } = req.body;
         if (!instanceId || !dockerImageUrl)
           return res.status(400).json({ error: "instanceId & dockerImageUrl required" });
+        if (!oneTimeToken) return res.status(401).json({ error: "one-time token required" });
+        try {
+          await axios.post(`${BACKEND_URL}/nodes/tokens/redeem`,
+            { nodeId: node.id, token: oneTimeToken },
+            { headers: { Authorization: `Bearer ${token}` } });
+        } catch (err) {
+          return res.status(401).json({ error: "one-time token rejected" });
+        }
         const { url } = await startContainer(instanceId, dockerImageUrl, env || {});
         res.json({ success: true, usageUrl: url });
       } catch (err) {
@@ -162,7 +189,7 @@ async function main() {
     setInterval(async () => {
       try {
         await axios.patch(`${BACKEND_URL}/nodes/status`,
-          { nodeId: node.id, status: "ONLINE" },
+          { nodeId: node.id, status: containers.size ? "BUSY" : "ONLINE" },
           { headers: { Authorization: `Bearer ${token}` } }
         );
       } catch (err) {

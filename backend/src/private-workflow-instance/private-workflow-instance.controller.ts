@@ -2,11 +2,11 @@ import { Controller, Post, Body, UseGuards, Request, Get, Param, Delete } from '
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PrivateWorkflowInstanceService } from './private-workflow-instance.service';
 
+@UseGuards(JwtAuthGuard)
 @Controller('workflow-instances')
 export class PrivateWorkflowInstanceController {
   constructor(private service: PrivateWorkflowInstanceService) {}
 
-  @UseGuards(JwtAuthGuard)
   @Post()
   async create(@Request() req, @Body('workflowId') workflowId: string, @Body('graphJson') graphJson: any) {
     return this.service.createInstance(req.user.id, workflowId, graphJson);
@@ -24,10 +24,9 @@ export class PrivateWorkflowInstanceController {
 
   @Get(':id')
   async get(@Request() req, @Param('id') id: string) {
-    return this.service.getInstance(id);
+    return this.service.getInstance(id, req.user.id);
   }
 
-  @UseGuards(JwtAuthGuard)
   @Delete(':id')
   async delete(@Request() req, @Param('id') id: string) {
     return this.service.deleteInstance(id, req.user.id);

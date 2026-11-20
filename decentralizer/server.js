@@ -1,7 +1,8 @@
 import express from "express";
 import dotenv from "dotenv";
 import { decryptEnv } from "./utils/decrypt.js";
-import { pullImage, waitForUrl } from "./utils/docker.js";
+import { pullImage, waitForReady } from "./utils/docker.js";
+import { evaluateCondition } from "./utils/condition.js";
 import Docker from "dockerode";
 import axios from "axios";
 import cors from "cors";
@@ -11,10 +12,17 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: '*',           // allow all origins
-  methods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','Accept'],
+  origin: process.env.CORS_ORIGIN || "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "x-runner-key"],
 }));
+
+const RUNNER_TOKEN = process.env.RUNNER_TOKEN;
+app.use((req, res, next) => {
+  if (!RUNNER_TOKEN || req.method !== "POST") return next();
+  if (req.get("x-runner-key") !== RUNNER_TOKEN) return res.status(401).json({ error: "Missing or invalid runner key" });
+  next();
+});
 
 app.post("/run", async (req, res) => {
   try {
@@ -37,6 +45,7 @@ app.post("/run", async (req, res) => {
     });
 
     await container.start();
+    await waitForReady(`http://localhost:${hostPort}`);
     console.log(`Instance ${instanceId} running at localhost:${hostPort}`);
 
     setTimeout(async () => {
@@ -56,17 +65,24 @@ app.post("/run", async (req, res) => {
   }
 });
 
+function parseShape(shape) {
+  if (!shape || typeof shape !== "string") return shape && typeof shape === "object" ? shape : null;
+  try {
+    const parsed = JSON.parse(shape);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 app.post("/run-and-test", async (req, res) => {
   try {
-    console.log("we got in!");
     const { instanceId, dockerImageUrl, envCipher, tests = [] } = req.body;
     if (!instanceId || !dockerImageUrl || !envCipher)
       return res.status(400).json({ error: "instanceId, dockerImageUrl, envCipher required" });
 
     const envVars = decryptEnv(envCipher);
-    console.log("we got the cipher: ", envCipher);
     await pullImage(dockerImageUrl);
-    console.log("pulled!");
 
     const hostPort = 30000 + Math.floor(Math.random() * 10000);
 
@@ -78,34 +94,25 @@ app.post("/run-and-test", async (req, res) => {
       name: `tool_${instanceId}`,
     });
 
-    console.log("container created.")
-
     await container.start();
-    console.log("container started.");
     const baseUrl = `http://localhost:${hostPort}`;
-
-    console.log("ready!");
+    await waitForReady(baseUrl);
 
     const results = [];
     let totalMs = 0;
     let totalOutBytes = 0;
     let totalMemMB = 0;
 
-    let inputShape = req.inputShape;
-    let outputShape = req.outputShape;
+    let inputShape = req.body.inputShape;
+    let outputShape = req.body.outputShape;
 
   for (const t of tests) {
-    const shape = typeof inputShape === "string" ? JSON.parse(inputShape) : inputShape;
-    const expectedShape = typeof outputShape === "string" ? JSON.parse(outputShape) : outputShape;
-
-    console.log(t.input);
+    const expectedShape = parseShape(outputShape);
 
     const input = t.input;
 
     const expected = t.expected;
     let out, duration, memUsage;
-
-    console.log(input);
 
     const start = Date.now();
     try {
@@ -206,12 +213,16 @@ app.post("/run-and-test", async (req, res) => {
 });
 
 const workflowStore = new Map();
+const decentralizedStore = new Map();
+const TEST_INSTANCE_TTL_MS = 25 * 60 * 1000;
+
 function topoSortNodes(nodes = [], edges = []) {
   const indeg = new Map(nodes.map(n => [n.id, 0]));
   const ad = new Map(nodes.map(n => [n.id, []]));
   edges.forEach(e => {
+    if (!ad.has(e.from) || !indeg.has(e.to)) return;
     ad.get(e.from).push(e.to);
-    indeg.set(e.to, (indeg.get(e.to) || 0) + 1);
+    indeg.set(e.to, indeg.get(e.to) + 1);
   });
   const q = [];
   for (const [id, d] of indeg.entries()) if (d === 0) q.push(id);
@@ -224,57 +235,164 @@ function topoSortNodes(nodes = [], edges = []) {
       if (indeg.get(nb) === 0) q.push(nb);
     }
   }
+  if (order.length !== nodes.length) throw new Error("Workflow graph has a cycle");
   return order;
+}
+
+const getByPath = (obj, path) => path?.split(".").map(p => p.trim()).reduce((acc, key) => acc?.[key], obj);
+
+const interpolateTemplate = (tpl, ctx) =>
+  tpl.replace(/\{\{(.*?)\}\}/g, (_, expr) => {
+    const val = getByPath(ctx, expr.trim());
+    if (val == null) return "";
+    return typeof val === "object" ? JSON.stringify(val) : String(val);
+  });
+
+function deriveEdges(graphJson) {
+  const nodes = graphJson.nodes || [];
+  if (graphJson.edges?.length || !nodes.some(n => n.inputs?.length)) return graphJson.edges || [];
+  const edges = [];
+  for (const node of nodes) {
+    for (const inp of node.inputs || []) {
+      if (!inp.source) continue;
+      const sourcePath = inp.path ? `${inp.source}.${inp.path}` : inp.source;
+      edges.push({ from: inp.source, to: node.id, mapping: { [inp.name]: `{{${sourcePath}}}` }, condition: inp.condition || null });
+    }
+  }
+  return edges;
+}
+
+async function executeGraph(graphJson, resolveUrl, globalInput = {}) {
+  const nodes = graphJson.nodes || [];
+  const edges = deriveEdges(graphJson);
+  const order = topoSortNodes(nodes, edges);
+  const results = {};
+
+  for (const nodeId of order) {
+    const incoming = edges.filter(e => e.to === nodeId);
+    let nodeInput = {};
+
+    if (incoming.length === 0) {
+      nodeInput = { ...globalInput };
+    } else {
+      for (const e of incoming) {
+        const from = results[e.from];
+        if (!from || from.status !== "ok") continue;
+        const context = { ...globalInput, ...(from.input || {}), ...(from.output || {}) };
+        let passed;
+        try {
+          passed = evaluateCondition(e.condition, context);
+        } catch (err) {
+          results[nodeId] = { input: {}, output: null, status: "error", error: { message: `Invalid condition: ${err.message}` } };
+          break;
+        }
+        if (!passed) continue;
+        const mapping = e.mapping && Object.keys(e.mapping).length ? e.mapping : null;
+        const mapped = mapping
+          ? Object.fromEntries(Object.entries(mapping).map(([k, v]) => [k, typeof v === "string" ? interpolateTemplate(v, context) : v]))
+          : { ...(from.output || {}) };
+        Object.assign(nodeInput, mapped);
+      }
+      if (results[nodeId]) continue;
+    }
+
+    if (Object.keys(nodeInput).length === 0 && incoming.length > 0) {
+      results[nodeId] = { input: {}, output: null, status: "skipped", reason: "no incoming edge matched" };
+      continue;
+    }
+
+    const url = resolveUrl(nodeId);
+    if (!url) {
+      results[nodeId] = { input: nodeInput, output: null, status: "error", error: { message: `No running container for ${nodeId}` } };
+      continue;
+    }
+
+    const started = Date.now();
+    try {
+      const r = await axios.post(`${url.replace(/\/$/, "")}/run`, nodeInput, { timeout: 30000 });
+      const output = r.data && r.data.output !== undefined ? r.data.output : r.data;
+      results[nodeId] = { input: nodeInput, output, status: "ok", ms: Date.now() - started };
+    } catch (err) {
+      results[nodeId] = {
+        input: nodeInput,
+        output: null,
+        status: "error",
+        ms: Date.now() - started,
+        error: { message: err.message, status: err.response?.status, response: err.response?.data },
+      };
+    }
+  }
+  return results;
+}
+
+async function removeContainerIfExists(name) {
+  try {
+    const existing = docker.getContainer(name);
+    await existing.remove({ force: true });
+  } catch {}
+}
+
+async function startWorkflowContainers(instanceId, nodes, fallbackEnv = {}) {
+  const containers = {};
+  try {
+    for (const node of nodes) {
+      await pullImage(node.dockerImageUrl);
+      const hostPort = 30000 + Math.floor(Math.random() * 10000);
+      const env = node.env && Object.keys(node.env).length ? node.env : fallbackEnv;
+      const name = `${instanceId}_${node.id}`;
+      await removeContainerIfExists(name);
+      const container = await docker.createContainer({
+        Image: node.dockerImageUrl,
+        Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
+        ExposedPorts: { "80/tcp": {} },
+        HostConfig: { PortBindings: { "80/tcp": [{ HostPort: hostPort.toString() }] }, AutoRemove: true },
+        name,
+      });
+      await container.start();
+      const usageUrl = `http://localhost:${hostPort}`;
+      containers[node.id] = { container, usageUrl };
+      await waitForReady(usageUrl);
+      console.log(`Node ${node.name ?? node.id} running at ${usageUrl}`);
+    }
+  } catch (err) {
+    await stopContainers(containers);
+    throw err;
+  }
+  return containers;
+}
+
+async function stopContainers(containers) {
+  await Promise.all(Object.values(containers).map(c => c.container.stop().catch(() => {})));
+}
+
+async function replaceWorkflow(instanceId, entry) {
+  const previous = workflowStore.get(instanceId);
+  if (previous) {
+    clearTimeout(previous.timer);
+    await stopContainers(previous.containers);
+  }
+  workflowStore.set(instanceId, entry);
+}
+
+function publicUrl(req, path) {
+  return `${process.env.RUNNER_PUBLIC_URL?.replace(/\/$/, "") || `${req.protocol}://${req.get("host")}`}${path}`;
 }
 
 app.post("/run-workflow", async (req, res) => {
   try {
     const { instanceId, graphJson, envCipher } = req.body;
-    if (!instanceId || !graphJson)
-      return res.status(400).json({ error: "instanceId and graphJson required" });
+    if (!instanceId || !graphJson) return res.status(400).json({ error: "instanceId and graphJson required" });
 
     const envVars = envCipher ? decryptEnv(envCipher) : {};
-    const containers = {};
-
-    for (const node of graphJson.nodes) {
-      await pullImage(node.dockerImageUrl);
-      const hostPort = 30000 + Math.floor(Math.random() * 10000);
-
-      const envVarsNode = node.env || envVars;
-
-      const container = await docker.createContainer({
-        Image: node.dockerImageUrl,
-        Env: Object.entries(envVarsNode).map(([k, v]) => `${k}=${v}`),
-        ExposedPorts: { "80/tcp": {} },
-        HostConfig: {
-          PortBindings: { "80/tcp": [{ HostPort: hostPort.toString() }] },
-          AutoRemove: true,
-        },
-        name: `${instanceId}_${node.id}`,
-      });
-
-      await container.start();
-      containers[node.id] = {
-        container,
-        usageUrl: `http://localhost:${hostPort}`,
-      };
-      console.log(`Node ${node.name} running at ${containers[node.id].usageUrl}`);
-    }
-
-    setTimeout(async () => {
-      for (const c of Object.values(containers)) {
-        try {
-          await c.container.stop();
-        } catch {}
-      }
+    const containers = await startWorkflowContainers(instanceId, graphJson.nodes, envVars);
+    const timer = setTimeout(async () => {
+      await stopContainers(containers);
       workflowStore.delete(instanceId);
-      console.log(`Workflow ${instanceId} stopped after 10min`);
-    }, 25 * 60 * 1000);
+      console.log(`Test workflow ${instanceId} stopped after 25 minutes`);
+    }, TEST_INSTANCE_TTL_MS);
 
-    workflowStore.set(instanceId, { graphJson, containers });
-    res.json({
-      usageUrl: `${req.protocol}://${req.get("host")}/workflow/${instanceId}/run`,
-    });
+    await replaceWorkflow(instanceId, { graphJson, containers, timer });
+    res.json({ usageUrl: publicUrl(req, `/workflow/${instanceId}/run`) });
   } catch (e) {
     console.error("run-workflow error:", e);
     res.status(500).json({ error: e.message });
@@ -283,115 +401,10 @@ app.post("/run-workflow", async (req, res) => {
 
 app.post("/workflow/:instanceId/run", async (req, res) => {
   try {
-    const { instanceId } = req.params;
-    const { input: globalInput = {} } = req.body;
-    const wf = workflowStore.get(instanceId);
+    const wf = workflowStore.get(req.params.instanceId);
     if (!wf) return res.status(404).json({ error: "Workflow instance not found" });
-
-    const { graphJson, containers } = wf;
-    const nodes = graphJson.nodes;
-    const edges = graphJson.edges || [];
-
-    const order = topoSortNodes(nodes, edges);
-    const results = {};
-
-    const getByPath = (obj, path) => {
-      if (!path) return undefined;
-      const parts = path.split(".").map(p => p.trim());
-      let cur = obj;
-      for (const p of parts) {
-        if (cur == null) return undefined;
-        cur = cur[p];
-      }
-      return cur;
-    };
-
-    const interpolateTemplate = (tpl, context) => {
-      return tpl.replace(/\{\{(.*?)\}\}/g, (_, expr) => {
-        const key = expr.trim();
-        const val = getByPath(context, key);
-        return val === undefined || val === null ? "" : String(val);
-      });
-    };
-
-    const evalCondition = (cond, context) => {
-      if (!cond) return true;
-      try {
-        const fn = new Function("ctx", `with (ctx) { return (${cond}); }`);
-        return Boolean(fn(context));
-      } catch (err) {
-        return false;
-      }
-    };
-
-    for (const nodeId of order) {
-      const node = nodes.find(n => n.id === nodeId);
-      const url = containers[nodeId].usageUrl;
-
-      let nodeInput = {};
-      const incoming = edges.filter(e => e.to === nodeId);
-
-      if (incoming.length === 0) {
-        nodeInput = { ...globalInput };
-      } else {
-        for (const e of incoming) {
-          const fromResult = results[e.from];
-          if (!fromResult) continue;
-
-          const sourceOutput = fromResult.output ?? {};
-          const sourceInput = fromResult.input ?? {};
-          const mergedContext = { ...globalInput, ...sourceOutput, ...sourceInput };
-
-          const conditionPassed = evalCondition(e.condition, mergedContext);
-          if (!conditionPassed) continue;
-
-          const mapped = {};
-          for (const [k, v] of Object.entries(e.mapping || {})) {
-            if (typeof v === "string") {
-              mapped[k] = interpolateTemplate(v, mergedContext);
-            } else {
-              mapped[k] = v;
-            }
-          }
-
-          if (!nodeInput._stack) nodeInput._stack = [];
-          nodeInput._stack.push({ from: e.from, mapping: mapped, matched: true });
-          Object.assign(nodeInput, mapped);
-        }
-      }
-
-      if (Object.keys(nodeInput).length === 0 && incoming.length > 0) {
-        results[nodeId] = {
-          input: {},
-          output: null,
-          status: "skipped",
-          reason: "no incoming edge matched or produced input"
-        };
-        continue;
-      }
-
-      try {
-        const r = await axios.post(`${url}/run`, nodeInput, { timeout: 20000 });
-        results[nodeId] = {
-          input: nodeInput,
-          output: r.data,
-          status: "ok"
-        };
-      } catch (err) {
-        const errInfo = {
-          message: err.message,
-          status: err.response?.status,
-          response: err.response?.data
-        };
-        results[nodeId] = {
-          input: nodeInput,
-          output: null,
-          status: "error",
-          error: errInfo
-        };
-      }
-    }
-
+    const { input = {} } = req.body;
+    const results = await executeGraph(wf.graphJson, id => wf.containers[id]?.usageUrl, input);
     res.json({ success: true, results });
   } catch (e) {
     console.error("workflow run error:", e);
@@ -402,109 +415,23 @@ app.post("/workflow/:instanceId/run", async (req, res) => {
 app.post("/run-workflow-and-test", async (req, res) => {
   try {
     const { instanceId, graphJson, envCipher, tests = [], globalInput = {} } = req.body;
-    if (!instanceId || !graphJson) 
-      return res.status(400).json({ error: "instanceId and graphJson required" });
+    if (!instanceId || !graphJson) return res.status(400).json({ error: "instanceId and graphJson required" });
 
     const envVars = envCipher ? decryptEnv(envCipher) : {};
-    const containers = {};
+    const containers = await startWorkflowContainers(instanceId, graphJson.nodes, envVars);
+    await replaceWorkflow(instanceId, { graphJson, containers, timer: null });
 
-    for (const node of graphJson.nodes) {
-      await pullImage(node.dockerImageUrl);
-      const hostPort = 30000 + Math.floor(Math.random() * 10000);
-      const envVarsNode = node.env || envVars;
-
-      const container = await docker.createContainer({
-        Image: node.dockerImageUrl,
-        Env: Object.entries(envVarsNode).map(([k, v]) => `${k}=${v}`),
-        ExposedPorts: { "80/tcp": {} },
-        HostConfig: {
-          PortBindings: { "80/tcp": [{ HostPort: hostPort.toString() }] },
-          AutoRemove: true,
-        },
-        name: `${instanceId}_${node.id}`,
-      });
-
-      await container.start();
-      containers[node.id] = {
-        container,
-        usageUrl: `http://localhost:${hostPort}`,
-      };
-      console.log(`Node ${node.name} running at ${containers[node.id].usageUrl}`);
-    }
-
-    workflowStore.set(instanceId, { graphJson, containers });
-
-    const getByPath = (obj, path) => path?.split(".").reduce((acc, key) => acc?.[key], obj);
-    const interpolateTemplate = (tpl, ctx) =>
-      tpl.replace(/\{\{(.*?)\}\}/g, (_, expr) => {
-        const val = getByPath(ctx, expr.trim());
-        return val == null ? "" : String(val);
-      });
-    const evalCondition = (cond, ctx) => {
-      if (!cond) return true;
-      try { return Boolean(new Function("ctx", `with(ctx){return (${cond});}`)(ctx)); }
-      catch { return false; }
-    };
-
-    const order = topoSortNodes(graphJson.nodes, graphJson.edges || []);
-    const nodeResults = {};
-
-    for (const test of tests) {
-      const testResults = {};
-      for (const nodeId of order) {
-        const node = graphJson.nodes.find(n => n.id === nodeId);
-        const url = containers[nodeId].usageUrl;
-
-        let nodeInput = {};
-        const incoming = (graphJson.edges || []).filter(e => e.to === nodeId);
-
-        if (incoming.length === 0) nodeInput = { ...globalInput, ...test.input };
-        else {
-          for (const e of incoming) {
-            const fromResult = nodeResults[e.from] || {};
-            const merged = { ...globalInput, ...fromResult.output, ...fromResult.input };
-            if (!evalCondition(e.condition, merged)) continue;
-
-            const mapped = {};
-            for (const [k, v] of Object.entries(e.mapping || {})) {
-              mapped[k] = typeof v === "string" ? interpolateTemplate(v, merged) : v;
-            }
-
-            if (!nodeInput._stack) nodeInput._stack = [];
-            nodeInput._stack.push({ from: e.from, mapping: mapped, matched: true });
-            Object.assign(nodeInput, mapped);
-          }
-        }
-
-        if (Object.keys(nodeInput).length === 0 && incoming.length > 0) {
-          testResults[nodeId] = { input: {}, output: null, status: "skipped" };
-          continue;
-        }
-
-        try {
-          const r = await axios.post(`${url}/run`, nodeInput, { timeout: 20000 });
-          testResults[nodeId] = { input: nodeInput, output: r.data, status: "ok" };
-        } catch (err) {
-          testResults[nodeId] = {
-            input: nodeInput,
-            output: null,
-            status: "error",
-            error: {
-              message: err.message,
-              status: err.response?.status,
-              response: err.response?.data,
-            },
-          };
-        }
-      }
-      nodeResults[test.name || `test_${tests.indexOf(test)}`] = testResults;
+    const resolve = id => containers[id]?.usageUrl;
+    const results = {};
+    for (const [i, test] of tests.entries()) {
+      results[test.name || `test_${i}`] = await executeGraph(graphJson, resolve, { ...globalInput, ...(test.input || {}) });
     }
 
     res.json({
       success: true,
-      workflowUsageUrl: `${req.protocol}://${req.get("host")}/workflow/${instanceId}/run`,
+      workflowUsageUrl: publicUrl(req, `/workflow/${instanceId}/run`),
       containers: Object.fromEntries(Object.entries(containers).map(([id, c]) => [id, c.usageUrl])),
-      results: nodeResults,
+      results,
     });
   } catch (e) {
     console.error("run-workflow-and-test error:", e);
@@ -512,198 +439,29 @@ app.post("/run-workflow-and-test", async (req, res) => {
   }
 });
 
-const decentralizedStore = new Map();
-
-app.post('/register-decentralized', async (req, res) => {
-  try {
-    const { instanceId, graphJson, mapping, tests = [] } = req.body;
-    if (!instanceId || !graphJson || !mapping) return res.status(400).json({ error: 'instanceId, graphJson, mapping required' });
-
-    // mapping: { nodeId: usageUrl }
-    decentralizedStore.set(instanceId, { graphJson, mapping, tests });
-
-    // Return the unified usageUrl for orchestrated runs
-    const workflowUsageUrl = `${req.protocol}://${req.get('host')}/decentralized/workflow/${instanceId}/run`;
-    res.json({ success: true, workflowUsageUrl });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
+app.post("/register-decentralized", (req, res) => {
+  const { instanceId, graphJson, mapping, tests = [] } = req.body;
+  if (!instanceId || !graphJson || !mapping) return res.status(400).json({ error: "instanceId, graphJson, mapping required" });
+  decentralizedStore.set(instanceId, { graphJson, mapping, tests });
+  res.json({ success: true, workflowUsageUrl: publicUrl(req, `/decentralized/workflow/${instanceId}/run`) });
 });
 
-app.post('/decentralized/workflow/:instanceId/run', async (req, res) => {
+app.post("/decentralized/workflow/:instanceId/run", async (req, res) => {
   try {
-    const { instanceId } = req.params;
-    const wf = decentralizedStore.get(instanceId);
-    if (!wf) return res.status(404).json({ error: 'Workflow not found' });
-
-    const { graphJson, mapping } = wf;
-    const { input: globalInput = {} } = req.body;
-
-    // Normalize nodes list
-    const nodes = graphJson.nodes || [];
-    // Build edges: prefer explicit edges if present; otherwise derive from node.inputs
-    let edges = graphJson.edges || [];
-    if ((!edges || edges.length === 0) && nodes.some(n => n.inputs && n.inputs.length)) {
-      edges = [];
-      for (const node of nodes) {
-        for (const inp of node.inputs || []) {
-          if (!inp.source) continue;
-          // Build a mapping template that references the source's output.
-          // If input has a 'path' field, reference it; otherwise use whole output.
-          const sourcePath = inp.path ? `${inp.source}.${inp.path}` : inp.source;
-          edges.push({
-            from: inp.source,
-            to: node.id,
-            // mapping will map the destination input name -> template that resolves to the relevant value
-            mapping: { [inp.name]: `{{${sourcePath}}}` },
-            condition: inp.condition || null
-          });
-        }
-      }
-    }
-
-    // Helpers (kept similar to centralized implementation)
-    const getByPath = (obj, path) => {
-      if (!path) return undefined;
-      const parts = path.split('.').map(p => p.trim());
-      let cur = obj;
-      for (const p of parts) {
-        if (cur == null) return undefined;
-        cur = cur[p];
-      }
-      return cur;
-    };
-
-    const interpolateTemplate = (tpl, context) => {
-      return tpl.replace(/\{\{(.*?)\}\}/g, (_, expr) => {
-        const key = expr.trim();
-        const val = getByPath(context, key);
-        return val === undefined || val === null ? "" : String(val);
-      });
-    };
-
-    const evalCondition = (cond, context) => {
-      if (!cond) return true;
-      try {
-        const fn = new Function("ctx", `with (ctx) { return (${cond}); }`);
-        return Boolean(fn(context));
-      } catch (err) {
-        return false;
-      }
-    };
-
-    // Topo sort using your earlier helper (nodes must be an array with .id)
-    const nodeOrder = topoSortNodes(nodes, edges);
-
-    const results = {}; // will hold { input, output, status, error? } keyed by nodeId
-
-    for (const nodeId of nodeOrder) {
-      const node = nodes.find(n => n.id === nodeId);
-      if (!node) {
-        results[nodeId] = { input: {}, output: null, status: 'error', error: 'node-not-found' };
-        continue;
-      }
-
-      // incoming edges for this node
-      const incoming = edges.filter(e => e.to === nodeId);
-
-      // Build nodeInput
-      let nodeInput = {};
-      if (incoming.length === 0) {
-        // no dependencies -> start with global input
-        nodeInput = { ...globalInput };
-      } else {
-        // For each incoming edge, merge context from the source result, evaluate condition, apply mapping
-        for (const e of incoming) {
-          const fromResult = results[e.from];
-          if (!fromResult) {
-            // If a source didn't run (missing), skip this edge
-            continue;
-          }
-
-          const sourceOutput = fromResult.output || {};
-          const sourceInput = fromResult.input || {};
-          // mergedContext allows mapping templates to reference fields directly
-          const mergedContext = { ...globalInput, ...sourceOutput, ...sourceInput };
-
-          const conditionPassed = evalCondition(e.condition, mergedContext);
-          if (!conditionPassed) continue;
-
-          const mapped = {};
-          for (const [k, v] of Object.entries(e.mapping || {})) {
-            if (typeof v === "string") {
-              mapped[k] = interpolateTemplate(v, mergedContext);
-            } else {
-              // allow literal values
-              mapped[k] = v;
-            }
-          }
-
-          if (!nodeInput._stack) nodeInput._stack = [];
-          nodeInput._stack.push({ from: e.from, mapping: mapped, matched: true });
-
-          // merge mapped fields into nodeInput (same semantics as centralized)
-          Object.assign(nodeInput, mapped);
-        }
-      }
-
-      // If this node had incoming edges but produced no input (no edge matched), mark skipped
-      if (Object.keys(nodeInput).length === 0 && incoming.length > 0) {
-        results[nodeId] = {
-          input: {},
-          output: null,
-          status: "skipped",
-          reason: "no incoming edge matched or produced input"
-        };
-        continue;
-      }
-
-      // Resolve the remote URL for this node from the provided mapping
-      const nodeUrl = mapping[nodeId];
-      if (!nodeUrl) {
-        results[nodeId] = {
-          input: nodeInput,
-          output: null,
-          status: "error",
-          error: `No mapped node URL for ${nodeId}`
-        };
-        continue;
-      }
-
-      // Call remote node
-      try {
-        const r = await axios.post(`${nodeUrl}/run`, nodeInput, { timeout: 20000 });
-
-        // Accept both shapes: { output: ... } (some runners) or raw response body
-        const normalizedOut = r.data && r.data.output !== undefined ? r.data.output : r.data;
-
-        results[nodeId] = {
-          input: nodeInput,
-          output: normalizedOut,
-          status: "ok"
-        };
-      } catch (err) {
-        results[nodeId] = {
-          input: nodeInput,
-          output: null,
-          status: "error",
-          error: {
-            message: err.message,
-            status: err.response?.status,
-            response: err.response?.data
-          }
-        };
-      }
-    }
-
-    return res.json({ success: true, results });
+    const wf = decentralizedStore.get(req.params.instanceId);
+    if (!wf) return res.status(404).json({ error: "Workflow not found" });
+    const { input = {} } = req.body;
+    const results = await executeGraph(wf.graphJson, id => wf.mapping[id], input);
+    res.json({ success: true, results });
   } catch (err) {
-    console.error('Decentralized workflow run error:', err);
+    console.error("Decentralized workflow run error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// changeable
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", workflows: workflowStore.size, decentralized: decentralizedStore.size });
+});
+
 const port = process.env.PORT || 3111;
-app.listen(port, () => console.log(`Runner listening on ${port}`));
+app.listen(port, () => console.log(`Runner listening on ${port}${RUNNER_TOKEN ? " (token required)" : ""}`));

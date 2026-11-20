@@ -60,14 +60,7 @@ function tryParseToolInputShape(raw: string | undefined | null): any | null {
     }
     return JSON.parse(s);
   } catch {
-    try {
-      // last resort; only use for trusted shapes
-      // eslint-disable-next-line no-new-func
-      const fn = new Function(`return (${raw});`);
-      return fn();
-    } catch {
-      return null;
-    }
+    return null;
   }
 }
 

@@ -64,16 +64,8 @@ function tryParseToolInputShape(raw: string | undefined | null): any | null {
 
     return JSON.parse(s);
   } catch (e) {
-    // 3) last resort: try Function() to evaluate JS object literal (risky).
-    // Use only if you control the DB contents and trust them.
-    try {
-      // eslint-disable-next-line no-new-func
-      const fn = new Function(`return (${raw});`);
-      return fn();
-    } catch (err) {
-      console.warn('Could not parse tool inputShape:', err, raw);
-      return null;
-    }
+    console.warn('Could not parse tool inputShape:', raw);
+    return null;
   }
 }
 
@@ -212,7 +204,6 @@ export default function WorkflowTesterPage() {
       alert('This instance is not yet deployed (no usageUrl).');
       return;
     }
-    console.log(inputShape)
 
     // build payload — **send exactly the tool's input shape**, not wrapped
     let payload: any;
@@ -239,12 +230,16 @@ export default function WorkflowTesterPage() {
     const finalPayload = {
         "input": payload
     };
+    let token = '';
     try {
-        console.log('Sending payload to usageUrl:', finalPayload);
-      // POST to the usageUrl (no auth header unless your runner requires one)
-      const resp = await axios.post(instance.usageUrl!, finalPayload, {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      token = JSON.parse(localStorage.getItem('access_token') ?? '{}').state?.token ?? '';
+    } catch {}
+    try {
+      const resp = await axios.post(
+        `${process.env.NEXT_PUBLIC_BACKEND_URL}/workflow-instances/${instance.id}/run`,
+        finalPayload,
+        { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` } },
+      );
 
       setResponseData(resp.data);
       setResponseText(JSON.stringify(resp.data, null, 2));
@@ -271,7 +266,7 @@ export default function WorkflowTesterPage() {
 
       {instance.usageUrl ? (
         <div className="mb-4 p-4 bg-green-900/20 border border-green-800 text-green-200 rounded">
-          usage url available for only 25 minutes: {instance.usageUrl}
+          Test containers are running for the next 25 minutes. Try a few inputs, then deploy.
         </div>
         
       ) : (

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { RegisterNodeDto } from './dto/node.dto';
 import { NodeStatus } from '@prisma/client';
@@ -31,6 +31,7 @@ export class NodeService {
           minPricePerSec: minPricePerSec || 0,
           url: url || "EMPTY",
           status: 'ONLINE',
+          lastSeenAt: new Date(),
         },
       });
     } else {
@@ -39,6 +40,7 @@ export class NodeService {
         data: {
           url,
           status: 'ONLINE',
+          lastSeenAt: new Date(),
           capabilities,
           minPricePerSec: minPricePerSec || node.minPricePerSec,
         },
@@ -48,17 +50,30 @@ export class NodeService {
     return node;
   }
 
-  async updateStatus(nodeId: string, status: NodeStatus) {
+  async updateStatus(userId: string, nodeId: string, status: NodeStatus) {
+    if (!nodeId) throw new BadRequestException('nodeId required');
     const node = await this.prisma.node.findFirst({
-      where: { id: nodeId },
+      where: { id: nodeId, ownerUserId: userId },
     });
-    if (!node) throw new Error('Node not found');
+    if (!node) throw new NotFoundException('Node not found');
 
     return this.prisma.node.update({
       where: { id: node.id },
       data: { status, lastSeenAt: new Date() },
     });
 }
+
+  async redeemToken(userId: string, nodeId: string, jti: string) {
+    if (!nodeId || !jti) throw new BadRequestException('nodeId and token required');
+    const node = await this.prisma.node.findFirst({ where: { id: nodeId, ownerUserId: userId } });
+    if (!node) throw new NotFoundException('Node not found');
+    const claimed = await this.prisma.oneTimeToken.updateMany({
+      where: { jti, nodeId, used: false, expiresAt: { gt: new Date() } },
+      data: { used: true },
+    });
+    if (claimed.count !== 1) throw new UnauthorizedException('Token is invalid, expired or already used');
+    return { valid: true };
+  }
 
   async getAllNodes() {
     return this.prisma.node.findMany();

@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateToolDto } from './dto/tool.dto';
 import { HttpService } from '@nestjs/axios';
 import { lastValueFrom } from 'rxjs';
+import { runnerHeaders } from '../common/runner';
 import { PrivateToolInstanceService } from '../private-tool-instance/private-tool-instance.service';
 import * as crypto from 'crypto';
 
@@ -86,7 +87,6 @@ export class ToolService {
   const runnerUrl = process.env.TOOL_DEPLOYER_URL || 'http://localhost:3111/run-and-test';
   let resp;
   try {
-    console.log("sent!");
     resp = await lastValueFrom(
       this.httpService.post(runnerUrl, {
         instanceId: `${toolId}-deploytest-${Date.now().toString(36)}`,
@@ -95,7 +95,7 @@ export class ToolService {
         tests,
         inputShape: tool.inputShape ?? {},
         outputShape: tool.outputShape ?? {},
-      }),
+      }, { headers: runnerHeaders(), timeout: 300_000 }),
     );
   } catch (e) {
     throw new InternalServerErrorException('Failed to contact test runner');

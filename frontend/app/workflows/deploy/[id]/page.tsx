@@ -60,14 +60,8 @@ function tryParseToolInputShape(raw: string | undefined | null): any | null {
     s = s.replace(/,(\s*[}\]])/g, '$1');
     return JSON.parse(s);
   } catch (e) {
-    try {
-      // eslint-disable-next-line no-new-func
-      const fn = new Function(`return (${raw});`);
-      return fn();
-    } catch (err) {
-      console.warn('Could not parse tool inputShape:', err, raw);
-      return null;
-    }
+    console.warn('Could not parse tool inputShape:', raw);
+    return null;
   }
 }
 

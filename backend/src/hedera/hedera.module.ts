@@ -1,9 +1,9 @@
-import { Module } from '@nestjs/common';
+import { Global, Module } from '@nestjs/common';
 import { HederaService } from './hedera.service';
-import { PrismaService } from '../prisma/prisma.service';
-import { PaymentsService } from '../payment/payment.service';
 
+@Global()
 @Module({
-  providers: [HederaService, PrismaService, PaymentsService]
+  providers: [HederaService],
+  exports: [HederaService],
 })
 export class HederaModule {}

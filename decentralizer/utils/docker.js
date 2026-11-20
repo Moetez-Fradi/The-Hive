@@ -3,7 +3,17 @@ import axios from "axios";
 
 const docker = new Docker();
 
+async function imageExistsLocally(image) {
+  try {
+    await docker.getImage(image).inspect();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function pullImage(image) {
+  if (await imageExistsLocally(image)) return;
   return new Promise((resolve, reject) => {
     docker.pull(image, (err, stream) => {
       if (err) return reject(err);
@@ -15,14 +25,13 @@ export async function pullImage(image) {
   });
 }
 
-export async function waitForUrl(url, timeoutMs = 60000, intervalMs = 6000) {
+export async function waitForReady(baseUrl, timeoutMs = 60000, intervalMs = 500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      console.log("looping...");
-      await axios.get(url, { timeout: 10000 });
+      await axios.get(baseUrl, { timeout: 2000, validateStatus: () => true });
       return true;
-    } catch (e) {
+    } catch {
       await new Promise(r => setTimeout(r, intervalMs));
     }
   }

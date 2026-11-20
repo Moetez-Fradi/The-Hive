@@ -50,6 +50,9 @@ export default function Navbar() {
           </div>
         ) : (
           <div className="flex items-center gap-4">
+            <Link href="/wallet" className="text-gray-300 hover:text-white transition-colors">
+              Wallet
+            </Link>
             <Link
               href={`/users/${userId}`}
               className="px-4 py-2 rounded-md bg-white/10 backdrop-blur-sm border border-white/20 text-white hover:bg-white/20 transition-all"

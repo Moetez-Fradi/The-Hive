@@ -91,6 +91,7 @@ model Workflow {
   workflowStatus          ToolStatus                @default(TESTING)
   PrivateWorkflowInstance PrivateWorkflowInstance[]
   tasks                   Task[]
+  runs                    WorkflowRun[]
   owner                   User                      @relation("UserWorkflows", fields: [ownerUserId], references: [id])
   @@unique([ownerUserId, name])
 }
@@ -102,6 +103,7 @@ model PrivateWorkflowInstance {
   usageUrl    String?
   createdAt   DateTime  @default(now())
   workflowId  String?
+  nodeMap     Json?
   owner       User      @relation("UserPrivateWorkflowInstances", fields: [ownerUserId], references: [id])
   Workflow    Workflow? @relation(fields: [workflowId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 }
@@ -130,8 +132,38 @@ model Payment {
   paid       Boolean  @default(false)
   txHash     String?
   memo       String?
+  hcsTopicId  String?
+  hcsSequence Int?
   createdAt  DateTime @default(now())
 }
+model WorkflowRun {
+  id          String   @id @default(cuid())
+  workflowId  String
+  userId      String
+  mode        String
+  status      String
+  input       Json
+  results     Json
+  nodes       Json     @default("{}")
+  inputHash   String
+  outputHash  String
+  runHash     String
+  hcsTopicId  String?
+  hcsSequence Int?
+  hcsTxId     String?
+  consensusAt String?
+  runtimeMs   Int
+  createdAt   DateTime @default(now())
+  workflow    Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId, createdAt])
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
 model Review {
   id      String  @id @default(cuid())
   toolId  String

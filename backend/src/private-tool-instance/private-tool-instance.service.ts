@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, ForbiddenException, InternalServerErrorE
 import { PrismaService } from '../prisma/prisma.service';
 import { HttpService } from '@nestjs/axios';
 import { lastValueFrom } from 'rxjs';
+import { runnerHeaders } from '../common/runner';
 import * as crypto from 'crypto';
 
 @Injectable()
@@ -32,13 +33,12 @@ export class PrivateToolInstanceService {
 
     const runnerUrl = process.env.TOOL_RUNNER_URL || 'http://localhost:3111/run';
     try {
-      console.log("contacting runner at: ", runnerUrl);
       const resp = await lastValueFrom(
         this.httpService.post(runnerUrl, {
           instanceId: instance.id,
           dockerImageUrl: tool.dockerImageUrl,
           envCipher: instance.envCipher,
-        }),
+        }, { headers: runnerHeaders(), timeout: 300_000 }),
       );
 
       if (resp?.data?.usageUrl) {

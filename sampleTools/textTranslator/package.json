@@ -8,10 +8,8 @@
   },
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Gemini powered text translator",
   "dependencies": {
-    "@vitalets/google-translate-api": "^9.2.1",
-    "body-parser": "^2.2.0",
     "dotenv": "^17.2.3",
     "express": "^5.1.0"
   }

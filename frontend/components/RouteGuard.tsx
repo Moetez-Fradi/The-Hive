@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useUserStore } from '../store/useUserStore';
 import { useWalletStore } from '../store/useWalletSore';
@@ -21,19 +21,25 @@ export default function RouteGuard({
 
   const { token } = useUserStore();
   const { accountId } = useWalletStore();
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
-    // redirect to login if user not authenticated
+    if (useUserStore.persist.hasHydrated()) setHydrated(true);
+    return useUserStore.persist.onFinishHydration(() => setHydrated(true));
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
     if (requireLogin && !token) {
       router.push(`/login?redirect=${pathname}`);
     }
     // redirect to wallet connect page if wallet not connected
     else if (requireWallet && !accountId) {
-      router.push(`/connect-wallet?redirect=${pathname}`);
+      router.push(`/wallet?redirect=${pathname}`);
     }
-  }, [requireLogin, requireWallet, token, accountId, router, pathname]);
+  }, [hydrated, requireLogin, requireWallet, token, accountId, router, pathname]);
 
-  // only render children if allowed
+  if (!hydrated) return null;
   if (requireLogin && !token) return null;
   if (requireWallet && !accountId) return null;
 

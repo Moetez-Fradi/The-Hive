@@ -9,13 +9,13 @@ export class NodeMonitorService {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  @Cron(CronExpression.EVERY_MINUTE)
   async checkOfflineNodes() {
-    const threshold = new Date(Date.now() - 6 * 60 * 1000);
+    const threshold = new Date(Date.now() - 3 * 60 * 1000);
     const result = await this.prisma.node.updateMany({
       where: {
-        status: NodeStatus.ONLINE,
-        lastSeenAt: { lt: threshold },
+        status: { in: [NodeStatus.ONLINE, NodeStatus.BUSY] },
+        OR: [{ lastSeenAt: { lt: threshold } }, { lastSeenAt: null }],
       },
       data: { status: NodeStatus.OFFLINE },
     });

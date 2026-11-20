@@ -1,6 +1,6 @@
 {
   "engines": {
-    "node": "20.x"
+    "node": ">=18"
   },
   "name": "frontend",
   "version": "0.1.0",
@@ -12,42 +12,26 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@buidlerlabs/hashgraph-react-wallets": "^2.5.0",
-    "@hashgraph/sdk": "^2.75.0",
-    "@supabase/auth-helpers-nextjs": "^0.8.7",
-    "@supabase/supabase-js": "^2.38.4",
-    "@walletconnect/types": "^2.22.4",
-    "@walletconnect/web3wallet": "^1.16.1",
+    "@hashgraph/sdk": "2.41.0",
     "axios": "^1.13.1",
-    "crypto-browserify": "^3.12.1",
-    "crypto-js": "4.1.1",
+    "buffer": "^6.0.3",
     "events": "^3.3.0",
-    "hashconnect": "0.1.9",
-    "hashgraph": "^0.0.5",
-    "kute.js": "^2.2.4",
-    "next": "14.0.0",
-    "next-transpile-modules": "^10.0.1",
-    "path-browserify": "^1.0.1",
+    "hashconnect": "3.0.14",
+    "next": "14.2.35",
     "react": "^18",
     "react-dom": "^18",
     "reactflow": "^11.11.4",
-    "stream-browserify": "^3.0.0",
     "typescript": "^5",
     "zustand": "^5.0.8"
   },
   "devDependencies": {
-    "@types/bn.js": "^5.2.0",
-    "@types/ms": "^2.1.0",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "autoprefixer": "^10.4.21",
     "eslint": "^8",
-    "eslint-config-next": "14.0.0",
+    "eslint-config-next": "14.2.35",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.18"
-  },
-  "overrides": {
-    "crypto-js": "4.1.1"
   }
 }

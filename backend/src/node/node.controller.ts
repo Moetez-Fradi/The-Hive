@@ -1,4 +1,4 @@
-import { Controller, Post, Body, UseGuards, Req, Patch, Get } from '@nestjs/common';
+import { Controller, Post, Body, UseGuards, Req, Patch, Get, HttpCode } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { NodeService } from './node.service';
 import { RegisterNodeDto } from './dto/node.dto';
@@ -18,8 +18,15 @@ export class NodeController {
   @UseGuards(JwtAuthGuard)
   @Patch('status')
   async updateStatus(@Req() req, @Body() body: { nodeId: string; status: 'ONLINE' | 'OFFLINE' | 'BUSY' | 'ERROR' }) {
-    const updated = await this.nodesService.updateStatus( body.nodeId, body.status);
+    const updated = await this.nodesService.updateStatus(req.user.id, body.nodeId, body.status);
     return { success: true, node: updated };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('tokens/redeem')
+  @HttpCode(200)
+  async redeemToken(@Req() req, @Body() body: { nodeId: string; token: string }) {
+    return this.nodesService.redeemToken(req.user.id, body.nodeId, body.token);
   }
 
   // in production change to pagination

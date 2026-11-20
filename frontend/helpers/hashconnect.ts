@@ -1,105 +1,114 @@
-// use hashconnect instead of cryptowallet
-import { HashConnect } from "hashconnect";
-import { TransferTransaction, Hbar } from "@hashgraph/sdk";
+import type { HashConnect } from "hashconnect";
 
-const STORAGE_KEY = "agenthive_hashconnect_v1";
-const NETWORK = "testnet";
+const PROJECT_ID = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || "";
 
-function loadSaved() {
-  if (typeof window === "undefined") return null;
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"); } catch { return null; }
+type Listener = (accountIds: string[]) => void;
+
+let instance: HashConnect | null = null;
+let initPromise: Promise<HashConnect> | null = null;
+let accountIds: string[] = [];
+const listeners = new Set<Listener>();
+
+function emit(ids: string[]) {
+  accountIds = ids;
+  listeners.forEach(l => l(ids));
 }
-function saveSaved(obj: any) {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
-}
 
-export async function connectToWallet() {
-  const hc = new HashConnect();
-  const appMetadata = {
-    name: "AgentHive PoC",
-    description: "Agenthive test",
-    icon: "https://cdn-icons-png.flaticon.com/512/4712/4712109.png",
+export function onAccountsChanged(listener: Listener) {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
   };
-
-  const saved = loadSaved();
-  let initData: any;
-  if (saved?.privKey) {
-    try { initData = await hc.init(appMetadata, saved.privKey); } catch { initData = await hc.init(appMetadata); }
-  } else {
-    initData = await hc.init(appMetadata);
-  }
-
-  if (initData?.privKey) saveSaved({ ...saved, privKey: initData.privKey, topic: initData.topic ?? saved?.topic ?? null });
-
-  const pairedPromise = new Promise<any>((resolve) => {
-    hc.pairingEvent.on((pd: any) => {
-      const s = loadSaved() || {};
-      if (pd.topic) { s.topic = pd.topic; saveSaved(s); }
-      if (pd.accountIds?.length) {
-        s.accountIds = pd.accountIds;
-        saveSaved(s);
-        resolve(pd);
-      }
-    });
-  });
-
-  const state = await hc.connect();
-  hc.findLocalWallets();
-  const pairingString = hc.generatePairingString(state, NETWORK, false);
-
-  if (saved?.accountIds?.length) {
-    return { hc, pairingString, pairingData: { accountIds: saved.accountIds, topic: saved.topic }, pairedPromise };
-  }
-
-  return { hc, pairingString, pairedPromise, pairingData: null };
 }
 
-export async function doPay(options: {
-  hc: any;
-  pairingData: any | null;
-  payment: { receipt: Array<{ receiver?: string; amount?: number }>; total?: number; memo?: string };
-  waitForPair?: boolean;
-}) {
-  const { hc, payment } = options;
-  let pairingData = options.pairingData;
-  if (!hc) throw new Error("HashConnect instance required");
+export function getConnectedAccount(): string | null {
+  return accountIds[0] ?? null;
+}
 
-  if (!pairingData && options.waitForPair) {
-    const saved = loadSaved();
-    if (saved?.accountIds?.length) pairingData = { accountIds: saved.accountIds, topic: saved.topic };
-    else {
-      const pd = await (options as any).pairedPromise;
-      pairingData = pd;
-    }
+export async function getHashConnect(): Promise<HashConnect> {
+  if (instance) return instance;
+  if (initPromise) return initPromise;
+  if (typeof window === "undefined") throw new Error("HashConnect is only available in the browser");
+  if (!PROJECT_ID) throw new Error("NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID is not set");
+
+  initPromise = (async () => {
+    const [{ HashConnect }, { LedgerId }] = await Promise.all([import("hashconnect"), import("@hashgraph/sdk")]);
+    const hc = new HashConnect(
+      LedgerId.TESTNET,
+      PROJECT_ID,
+      {
+        name: "AgentHive",
+        description: "Decentralized AI agent marketplace on Hedera",
+        icons: [`${window.location.origin}/favicon.ico`],
+        url: window.location.origin,
+      },
+      false,
+    );
+    hc.pairingEvent.on(session => emit((session.accountIds ?? []).map(String)));
+    hc.disconnectionEvent.on(() => emit([]));
+    await hc.init();
+    emit(hc.connectedAccountIds.map(a => a.toString()));
+    instance = hc;
+    return hc;
+  })();
+
+  try {
+    return await initPromise;
+  } catch (err) {
+    initPromise = null;
+    throw err;
   }
+}
 
-  if (!pairingData?.accountIds?.length) throw new Error("Wallet not paired or no account ID available");
-  if (!pairingData.topic) throw new Error("Pairing topic missing");
+export async function connectWallet(timeoutMs = 5 * 60 * 1000): Promise<string> {
+  const hc = await getHashConnect();
+  if (accountIds.length) return accountIds[0];
 
-  const fromId = pairingData.accountIds[0];
-  const total = payment.total ?? payment.receipt.reduce((s, it) => s + Number(it.amount || 0), 0);
-  if (total <= 0) throw new Error("Nothing to pay");
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      off();
+      reject(new Error("Wallet pairing timed out"));
+    }, timeoutMs);
+    const off = onAccountsChanged(ids => {
+      if (!ids.length) return;
+      clearTimeout(timer);
+      off();
+      resolve(ids[0]);
+    });
+    hc.openPairingModal();
+  });
+}
 
-  const byReceiver: Record<string, number> = {};
-  for (const it of payment.receipt) {
-    if (!it.receiver) continue;
-    byReceiver[it.receiver] = (byReceiver[it.receiver] || 0) + Number(it.amount || 0);
+export async function disconnectWallet() {
+  if (!instance) return;
+  await instance.disconnect();
+  emit([]);
+}
+
+export type ReceiptItem = { receiver?: string; amount?: number; toolName?: string };
+
+export async function payReceipt(receipt: ReceiptItem[], memo?: string): Promise<{ txId: string; payer: string }> {
+  const hc = await getHashConnect();
+  const payer = getConnectedAccount() ?? (await connectWallet());
+  const { TransferTransaction, Hbar, AccountId } = await import("@hashgraph/sdk");
+
+  const tinybarsByReceiver: Record<string, number> = {};
+  for (const it of receipt) {
+    if (!it.receiver || it.receiver === payer) continue;
+    const tinybars = Math.round(Number(it.amount || 0) * 100_000_000);
+    if (tinybars <= 0) continue;
+    tinybarsByReceiver[it.receiver] = (tinybarsByReceiver[it.receiver] || 0) + tinybars;
   }
+  const receivers = Object.keys(tinybarsByReceiver);
+  if (!receivers.length) throw new Error("Nothing to pay");
 
-  const tx = new TransferTransaction().setTransactionMemo(payment.memo || "");
-  tx.addHbarTransfer(fromId, new Hbar(-total));
-  for (const r of Object.keys(byReceiver)) {
-    tx.addHbarTransfer(r, new Hbar(byReceiver[r]));
-  }
+  const total = receivers.reduce((s, r) => s + tinybarsByReceiver[r], 0);
+  const tx = new TransferTransaction().addHbarTransfer(payer, Hbar.fromTinybars(-total));
+  for (const r of receivers) tx.addHbarTransfer(r, Hbar.fromTinybars(tinybarsByReceiver[r]));
+  if (memo) tx.setTransactionMemo(memo.slice(0, 100));
 
-  const provider = hc.getProvider(NETWORK, pairingData.topic, fromId);
-  const signer = hc.getSigner(provider);
-  if (!signer) throw new Error("Signer not available from HashConnect");
-
-  await (tx as any).freezeWithSigner(signer);
-  const txResponse = await (tx as any).executeWithSigner(signer);
-  const txId = txResponse?.transactionId?.toString?.() ?? String(txResponse);
-
-  return { txId, txResponse };
+  const signer = hc.getSigner(AccountId.fromString(payer) as any);
+  const frozen = await tx.freezeWithSigner(signer as any);
+  const response = await frozen.executeWithSigner(signer as any);
+  return { txId: response.transactionId.toString(), payer };
 }
